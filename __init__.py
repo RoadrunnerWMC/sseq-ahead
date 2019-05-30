@@ -38,6 +38,7 @@ class SSEQTrackPlayer:
     trackState = None
     events = None
     _idx = 0
+    _processedPC = False
 
     def __init__(self, globalState, trackState, events, initialIndex=0):
         self.globalState = globalState
@@ -55,34 +56,59 @@ class SSEQTrackPlayer:
     def step(self, amount):
         """
         Step by `amount` time steps. A nonzero value will end with
-        self.pc on a rest event, and "0" will step through all pending
-        events with zero duration.
+        self.pc on or immediately following a rest event, and "0" will
+        step through all pending events with zero duration.
         """
         checkStepAmount(amount)
 
-        while True:
+        continueIfZero = (amount == 0)
+
+        def progress():
+            """
+            Attempt to make progress, and return True if we should go again
+            """
+            nonlocal amount
+
+            keepGoing = True
+
+            # Process the current event if we haven't done so yet
+            if not self._processedPC:
+                self._processPC()
+                self._processedPC = True
+
+            # Handle rest timers
             if self.trackState.restTimer > 0:
-                if amount > 0:
-                    if amount <= self.trackState.restTimer:
-                        self.trackState.restTimer -= amount
-                        # print('path A (%d steps left)' % self.trackState.restTimer)
-                        return
-                    else:
-                        # print('path B')
-                        self.trackState.restTimer = 0
-                        amount -= self.trackState.restTimer
+                if amount >= self.trackState.restTimer:
+                    # We can cover the whole rest period, so do so
+                    self.trackState.restTimer = 0
+                    amount -= self.trackState.restTimer
                 else:
-                    return
+                    # We can't cover the entire rest period. Stop here.
+                    self.trackState.restTimer -= amount
+                    return False
 
-            self.stepSingle()
+            # If we're not waiting for anything, move to the next event
+            if self.trackState.restTimer == 0:
+                self._moveNext()
+                self._processedPC = False
 
-    def stepSingle(self):
+                if not continueIfZero:
+                    keepGoing = False
+
+            return keepGoing
+
+        while progress():
+            pass
+
+
+    def _processPC(self):
         """
-        Process one sequence event and return it
+        Process the effects of self.pc. This must happen only once per
+        sequence event!
+        This function will not modify self.pc. To do that, call
+        _moveNext().
         """
         e = self.pc
-
-        didJump = False
 
         if isinstance(e, ndspy.soundSequence.NoteSequenceEvent):
             ...
@@ -94,8 +120,7 @@ class SSEQTrackPlayer:
         elif isinstance(e, ndspy.soundSequence.BeginTrackSequenceEvent):
             ...
         elif isinstance(e, ndspy.soundSequence.JumpSequenceEvent):
-            self._idx = self.events.index(e.destination)
-            didJump = True
+            pass
         elif isinstance(e, ndspy.soundSequence.CallSequenceEvent):
             ...
         elif isinstance(e, ndspy.soundSequence.RandomSequenceEvent):
@@ -198,13 +223,66 @@ class SSEQTrackPlayer:
         else:
             raise ValueError('Unexpected sequence event:', e)
 
-        if not didJump:
+
+    def _moveNext(self):
+        """
+        Move self.pc to whatever follows it, respecting jumps and the
+        like.
+        """
+        e = self.pc
+
+        if isinstance(e, ndspy.soundSequence.BeginTrackSequenceEvent):
+            raise NotImplementedError
+        elif isinstance(e, ndspy.soundSequence.JumpSequenceEvent):
+            self._idx = self.events.index(e.destination)
+        elif isinstance(e, ndspy.soundSequence.CallSequenceEvent):
+            raise NotImplementedError
+        elif isinstance(e, ndspy.soundSequence.EndLoopSequenceEvent):
+            raise NotImplementedError
+        elif isinstance(e, ndspy.soundSequence.ReturnSequenceEvent):
+            raise NotImplementedError
+        elif isinstance(e, ndspy.soundSequence.EndTrackSequenceEvent):
+            raise NotImplementedError
+        else:
             self._idx += 1
 
-        return e
+
+class SSEQPlayer:
+    """
+    ABC for a SSEQ player
+    """
+    timeElapsed = 0.0 # seconds
+    globalState = None
+    trackStates = None
+    trackPlayers = None
+
+    def step(self, amount):
+        # We have to keep all track players in sync because they can
+        # change global things within the requested `amount` (such as
+        # tempo)
+        checkStepAmount(amount)
+
+        while True:
+            # Check how many steps we can do at once before something changes
+            steps = min(ts.restTimer for ts in self.trackStates.values())
+            steps = min(steps, amount)
+
+            # Do that many steps
+            for tp in self.trackPlayers.values():
+                tp.step(steps)
+            amount -= steps
+
+            # seconds = steps * (beats/step) * (mins/beat) * (secs/min)
+            #         = steps * 1/48 * 1/tempo * 60
+            #         = steps / tempo * 60/48
+            self.timeElapsed += steps / self.globalState.tempo * 60/48
+
+            # Putting the test here to make it like a do-while loop
+            if amount <= 0:
+                break
 
 
-class SSEQMusicPlayer:
+class SSEQMusicPlayer(SSEQPlayer):
     """
     Plays a ndspy.extras.music.SSEQMusic
     """
@@ -221,29 +299,8 @@ class SSEQMusicPlayer:
             self.trackPlayers[id] = SSEQTrackPlayer(
                 self.globalState, self.trackStates[id], t.events)
 
-    def step(self, amount):
-        # We have to keep all track players in sync because they can
-        # change global things within the requested `amount` (such as
-        # tempo)
-        checkStepAmount(amount)
 
-        while amount > 0:
-            # Check how many steps we can do at once before something changes
-            steps = min(ts.restTimer for ts in self.trackStates.values())
-            steps = min(steps, amount)
-
-            # Do that many steps
-            for tp in self.trackPlayers.values():
-                tp.step(steps)
-            amount -= steps
-
-            # seconds = steps * (beats/step) * (mins/beat) * (secs/min)
-            #         = steps * 1/48 * 1/tempo * 60
-            #         = steps / tempo * 60/48
-            self.timeElapsed += steps / self.globalState.tempo * 60/48
-
-
-class ParsedSSEQPlayer:
+class ParsedSSEQPlayer(SSEQPlayer):
     """
     Plays a parsed ndspy.soundSequence.SSEQ
     """
@@ -256,13 +313,21 @@ class ParsedSSEQPlayer:
             self.globalState, self.trackStates[0], self.sseq.events)
         self.trackPlayers = {0: trackPlayer}
 
-    def step(self, amount):
-        for track in self.trackPlayers.values():
-            track.step(amount)
 
-
-class UnparsedSSEQPlayer:
+class UnparsedSSEQPlayer(SSEQPlayer):
     """
     Play an unparsed ndspy.soundSequence.SSEQ
     """
     ...
+
+
+def player(item):
+    """
+    Return an appropriate SSEQPlayer subclass instance for the given item
+    """
+    if isinstance(item, ndspy.extras.music.SSEQMusic):
+        return SSEQMusicPlayer(item)
+    elif isinstance(item, ndspy.soundSequence.SSEQ):
+        return (ParsedSSEQPlayer if item.parsed else UnparsedSSEQPlayer)(item)
+
+    raise ValueError(f'No player available for {item}')
