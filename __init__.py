@@ -11,6 +11,14 @@ def checkStepAmount(amount):
         raise ValueError('step amount must be non-negative')
 
 
+def checkTimeAmount(amount):
+    """
+    Helper function to do sanity checks on the provided time amount
+    """
+    if amount < 0:
+        raise ValueError('time amount must be non-negative')
+
+
 class SSEQGlobalState:
     """
     Should maybe be a data class?
@@ -251,10 +259,12 @@ class SSEQPlayer:
     """
     ABC for a SSEQ player
     """
-    timeElapsed = 0.0 # seconds
     globalState = None
     trackStates = None
     trackPlayers = None
+
+    timeElapsed = 0.0 # seconds
+    stepsElapsed = 0
 
     def step(self, amount):
         # We have to keep all track players in sync because they can
@@ -262,24 +272,60 @@ class SSEQPlayer:
         # tempo)
         checkStepAmount(amount)
 
+        targetTotal = self.stepsElapsed + amount
+
         while True:
-            # Check how many steps we can do at once before something changes
-            steps = min(ts.restTimer for ts in self.trackStates.values())
-            steps = min(steps, amount)
 
-            # Do that many steps
-            for tp in self.trackPlayers.values():
-                tp.step(steps)
-            amount -= steps
-
-            # seconds = steps * (beats/step) * (mins/beat) * (secs/min)
-            #         = steps * 1/48 * 1/tempo * 60
-            #         = steps / tempo * 60/48
-            self.timeElapsed += steps / self.globalState.tempo * 60/48
+            self._singleStepUntilChangeOr(amount)
+            amount = targetTotal - self.stepsElapsed
 
             # Putting the test here to make it like a do-while loop
             if amount <= 0:
                 break
+
+    def timeStep(self, amount):
+        """
+        amount is measured in seconds
+        """
+        # We have to keep all track players in sync because they can
+        # change global things within the requested `amount` (such as
+        # tempo)
+        checkTimeAmount(amount)
+
+        targetTotal = self.timeElapsed + amount
+
+        while True:
+
+            # steps = (seconds) * (mins/sec) * (beats/min) * (steps/beat)
+            #       = secs * 1/60 * tempo * 48
+            #       = secs * tempo * 48/60
+            steps = int(amount * self.globalState.tempo * 48/60)
+            if steps == 0 and amount > 0: steps = 1
+            self._singleStepUntilChangeOr(steps)
+            amount = targetTotal - self.timeElapsed
+
+            # Putting the test here to make it like a do-while loop
+            if amount <= 0:
+                break
+
+    def _singleStepUntilChangeOr(self, maxSteps):
+        """
+        Step all tracks simultaneously until either something changes,
+        or maxSteps (whichever comes first)
+        """
+        # Check how many steps we can do at once before something changes
+        steps = min(ts.restTimer for ts in self.trackStates.values())
+        steps = min(steps, maxSteps)
+
+        # Do that many steps
+        for tp in self.trackPlayers.values():
+            tp.step(steps)
+        self.stepsElapsed += steps
+
+        # seconds = steps * (beats/step) * (mins/beat) * (secs/min)
+        #         = steps * 1/48 * 1/tempo * 60
+        #         = steps / tempo * 60/48
+        self.timeElapsed += steps / self.globalState.tempo * 60/48
 
 
 class SSEQMusicPlayer(SSEQPlayer):
